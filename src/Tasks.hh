@@ -2,7 +2,10 @@
 #include <iostream>
 #include <cstring>
 #include <vector>
+#include <string>
+#include <algorithm>
 #include <unistd.h>
+
 
 void reply(int client, const char *status_line, const char *body);
 
@@ -14,9 +17,13 @@ protected:
   
 public:
   Task(int client) : client(client) {};
+  
   virtual ~Task() {
-    fsync(client);		// Just in case
-    close(client);		// We _hope_ it closes
+    // Safety check: Only close if the socket is valid.
+    if (client >= 0) {
+        fsync(client);
+        close(client);
+    }
   };
 
   virtual int execute() = 0;	// Execute the task
@@ -94,8 +101,8 @@ private:
   int script_id;
   std::vector<std::string> args;
 public:
-  RunTask(int client, int id, std::vector<std::string>args)
-    : Task(client), script_id(id), args(args) {};
+  RunTask(int client, int id, std::vector<std::string> a)
+    : Task(client), script_id(id), args(std::move(a)) {};
   int execute();
 };
 
@@ -104,8 +111,7 @@ private:
   std::string filename;
   std::string script;
 public:
-  UploadTask(int client, std::string filename, std::string script)
-    : Task(client), filename(filename), script(script) {};
+  UploadTask(int client, std::string fn, std::string s)
+    : Task(client), filename(std::move(fn)), script(std::move(s)) {};
   int execute();
 };
-
