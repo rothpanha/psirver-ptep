@@ -3,8 +3,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
-#include <syslog.h>
-#include <unistd.h> 
+#include <syslog.h> 
 
 #include "utils.hh"
 
@@ -27,7 +26,7 @@ void usage(const char* prog)
 // - std::stoi()
 int16_t select_port(int argc, char **argv)
 {
-  int server_port_tmp = DEFAULT_PORT;
+  int16_t server_port_tmp = DEFAULT_PORT;
   if (argc > 2) {		// Too many parameters
     usage(argv[0]);		// No return
   }

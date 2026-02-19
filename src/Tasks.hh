@@ -2,10 +2,10 @@
 #include <iostream>
 #include <cstring>
 #include <vector>
-#include <string>
-#include <algorithm>
 #include <unistd.h>
 
+static constexpr char RN[] = "\r\n";
+static constexpr char END_OF_HEADER[] = "\r\n\r\n";
 
 void reply(int client, const char *status_line, const char *body);
 
@@ -17,19 +17,18 @@ protected:
   
 public:
   Task(int client) : client(client) {};
-  
   virtual ~Task() {
-    // Safety check: Only close if the socket is valid.
-    if (client >= 0) {
-        fsync(client);
-        close(client);
-    }
+    fsync(client);		// Just in case
+    close(client);		// We _hope_ it closes
   };
 
   virtual int execute() = 0;	// Execute the task
   
-  static Task *construct(int client, std::string headers); // GET
-  static Task *construct(int client, std::string headers, std::string body); // POST
+  static Task *construct(int client,
+			 const std::string& headers); // GET
+  static Task *construct(int client,
+			 const std::string& headers,
+			 const std::string& body); // POST
 }; 
 
 class HealthTask : public Task { // GET /health
@@ -101,8 +100,8 @@ private:
   int script_id;
   std::vector<std::string> args;
 public:
-  RunTask(int client, int id, std::vector<std::string> a)
-    : Task(client), script_id(id), args(std::move(a)) {};
+  RunTask(int client, int id, std::vector<std::string>args)
+    : Task(client), script_id(id), args(args) {};
   int execute();
 };
 
@@ -111,7 +110,8 @@ private:
   std::string filename;
   std::string script;
 public:
-  UploadTask(int client, std::string fn, std::string s)
-    : Task(client), filename(std::move(fn)), script(std::move(s)) {};
+  UploadTask(int client, std::string filename, std::string script)
+    : Task(client), filename(filename), script(script) {};
   int execute();
 };
+
