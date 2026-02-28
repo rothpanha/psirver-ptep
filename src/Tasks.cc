@@ -13,20 +13,6 @@ const std::string HEADER_BOUND = "boundary=";
 const std::string HEADER_FNAME = "filename=\"";
 const std::string CRLF_2 = "\r\n\r\n";
 
-// The Kernel State
-struct Script { int id; std::string name, text; };
-struct Job { int id, script_id; std::string script_name, status, out, err; };
-
-static std::vector<Script> g_scripts;
-static std::vector<Job> g_jobs;
-static int g_next_sid = 1;
-static int g_next_jid = 1;
-
-// Ensures the Task destructor does not try to close an already-closed socket.
-static void send_and_detach(int &client, const char *status, const std::string &body){
-  reply(client, status, body.c_str());
-  client = -1; 
-}
 // Checks if a string s starts with the given prefix.
 static bool starts_with(const std::string& s, const std::string& prefix){ 
     return s.rfind(prefix, 0) == 0; 
@@ -80,119 +66,37 @@ static std::string url_decode(const std::string& s){
   return ret;
 }
 
-// Helper to find a script in the global vector by its id.
-static Script* find_script(int id){ for(auto& s : g_scripts) if(s.id == id) return &s; return nullptr; }
-
-// Helper to find a job in the global vector by its id.
-static Job* find_job(int id){ for(auto& j : g_jobs) if(j.id == id) return &j; return nullptr; }
-
-// GET /health: Returns 200 OK to indicate server is running.
-int HealthTask::execute() {
-  send_and_detach(client, "HTTP/1.1 200 OK", "OK\n");
+int HealthTask::execute(){ 
   return 0;
 }
-// GET /teapot: Returns 418 I'm a teapot.
-int TeapotTask::execute() {
-  send_and_detach(client, "HTTP/1.1 418 I'm a teapot", "I'm a teapot\n");
+int TeapotTask::execute(){ 
+  return 0; 
+}
+int JobListTask::execute(){
+  return 0; 
+}
+int ScriptListTask::execute(){
+  return 0; 
+}
+int DeleteTask::execute(){ 
+  return 0; 
+}
+int JobStatusTask::execute(){
+  return 0; 
+}
+int TerminateTask::execute(){
+  return 0; 
+}
+int StdoutTask::execute(){ 
   return 0;
 }
-
-// GET /jobs: Lists all currently running jobs.
-int JobListTask::execute() {
-  std::string body;
-  for(const auto& j : g_jobs) {
-      if(j.status == "running") {
-          body += std::to_string(j.id) + "," + std::to_string(j.script_id) + "," + j.script_name + "\n";
-      }
-  }
-  send_and_detach(client, "HTTP/1.1 200 OK", body);
+int StderrTask::execute(){
   return 0;
 }
-
-// GET /scripts: Lists all uploaded scripts.
-int ScriptListTask::execute() {
-  std::string body;
-  for(const auto& s : g_scripts) {
-      body += std::to_string(s.id) + "," + s.name + "\n";
-  }
-  send_and_detach(client, "HTTP/1.1 200 OK", body);
-  return 0;
+int RunTask::execute(){
+  return 0; 
 }
-
-// GET /scripts/<id>/delete: Removes a script from memory if it exists.
-int DeleteTask::execute() {
-  if(!find_script(script_id)) {
-      send_and_detach(client, "HTTP/1.1 404 Not Found", "Not Found");
-      return 0;
-  }
-  g_scripts.erase(std::remove_if(g_scripts.begin(), g_scripts.end(),
-      [&](const Script& s){ return s.id == script_id; }), g_scripts.end());
-  send_and_detach(client, "HTTP/1.1 200 OK", "OK\n");
-  return 0;
-}
-
-// GET /jobs/<id>: Returns the status of a specific job.
-int JobStatusTask::execute() {
-  Job* j = find_job(job_id);
-  if(!j) { send_and_detach(client, "HTTP/1.1 404 Not Found", "Not Found"); return 0; }
-  std::string body = std::to_string(j->script_id) + "," + j->script_name + "," + j->status + "\n";
-  send_and_detach(client, "HTTP/1.1 200 OK", body);
-  return 0;
-}
-
-// GET /jobs/<id>/terminate: Stops a job and removes it from the list.
-int TerminateTask::execute() {
-  if(!find_job(job_id)) { send_and_detach(client, "HTTP/1.1 404 Not Found", "Not Found"); return 0; }
-  g_jobs.erase(std::remove_if(g_jobs.begin(), g_jobs.end(),
-      [&](const Job& j){ return j.id == job_id; }), g_jobs.end());
-  send_and_detach(client, "HTTP/1.1 200 OK", "OK\n");
-  return 0;
-}
-
-// GET /jobs/<id>/stdout: Returns standard output. Returns 202 if still running.
-int StdoutTask::execute() {
-  Job* j = find_job(job_id);
-  if(!j) { send_and_detach(client, "HTTP/1.1 404 Not Found", "Not Found"); return 0; }
-  if(j->status == "running") send_and_detach(client, "HTTP/1.1 202 Accepted", "");
-  else send_and_detach(client, "HTTP/1.1 200 OK", j->out);
-  return 0;
-} 
-
-// GET /jobs/<id>/stderr: Returns standard error. Returns 202 if still running.
-int StderrTask::execute() {
-  Job* j = find_job(job_id);
-  if(!j) { send_and_detach(client, "HTTP/1.1 404 Not Found", "Not Found"); return 0; }
-  if(j->status == "running") send_and_detach(client, "HTTP/1.1 202 Accepted", "");
-  else send_and_detach(client, "HTTP/1.1 200 OK", j->err);
-  return 0;
-}
-
-// POST /scripts/<id>/run: Creates a new job for the given script.
-// Returns 303 See Other redirecting to the new job's status page.
-int RunTask::execute() {
-  Script* s = find_script(script_id);
-  if(!s) { send_and_detach(client, "HTTP/1.1 404 Not Found", "Not Found"); return 0; }
-  Job j; j.id = g_next_jid++; j.script_id = s->id; j.script_name = s->name; j.status = "running";
-  g_jobs.push_back(j);
-  
-  std::string loc = PREFIX_JOBS + std::to_string(j.id);
-  std::string body = std::to_string(j.id) + "\n";
-  std::string resp = "HTTP/1.1 303 See Other\r\nLocation: " + loc + 
-                     "\r\nContent-Length: " + std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n";
-  
-  if (write(client, resp.c_str(), resp.size()) < 0 || write(client, body.c_str(), body.size()) < 0) {
-      std::cerr << "Write failed" << std::endl;
-  }
-  close(client);
-  client = -1;
-  return 0;
-}
-
-// POST /scripts/upload: Saves a new script to memory and returns its id.
-int UploadTask::execute() {
-  int id = g_next_sid++;
-  g_scripts.push_back({id, filename, script});
-  send_and_detach(client, "HTTP/1.1 200 OK", std::to_string(id) + "\n");
+int UploadTask::execute(){
   return 0;
 }
 
@@ -255,7 +159,7 @@ Task *Task::construct(int client, std::string headers, std::string body)
       }
   }
 
-  if(path == "/scripts/upload") {
+  if(path == "/scripts" || path == "/scripts/upload") {
       if(!header_has(headers, "multipart/form-data")) {
           reply(client, "HTTP/1.1 415 Unsupported Media Type", "Unsupported Media Type");
           return nullptr;

@@ -178,13 +178,13 @@ Task *request2task()
   }
 
 if(request.compare(0, 4, "GET ") == 0) {
-    std::string headers = request.substr(0, header_end_pos);
+    std::string headers = request.substr(0, header_end_pos  + (sizeof END_OF_HEADER - 1));
 
     return Task::construct(client, headers); 
 }
 
 if(request.compare(0, 5, "POST ") == 0) {
-    std::string headers = request.substr(0, header_end_pos);
+    std::string headers = request.substr(0, header_end_pos  + (sizeof END_OF_HEADER - 1));
 
     ssize_t content_length = parse_content_length(client, headers);
     
@@ -195,9 +195,8 @@ if(request.compare(0, 5, "POST ") == 0) {
 
     return Task::construct(client, headers, body);
 }
-  
-  reply(client, "HTTP/1.1 405 Method Not Allowed",
-	(request.substr(0, 0x10) + "...").c_str());
+  std::string preview = request.substr(0, 0x10) + "...";
+  reply(client, "HTTP/1.1 405 Method Not Allowed", preview.c_str());
   return nullptr;
 }
 
@@ -240,7 +239,6 @@ int main(int argc, char **argv)
     
     // Main processing will happen here, but now all tasks are nullptrs
     if (task) {
-      task->execute();
       delete task;
     }
   }
