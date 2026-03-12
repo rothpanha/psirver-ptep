@@ -181,7 +181,7 @@ Task *request2task()
     }
     
     // TODO: move messaging to execute()
-    reply(client, "HTTP/1.1 200 OK", "Hello from Psirver!");
+    // reply(client, "HTTP/1.1 200 OK", "Hello from Psirver!");
     return task;
   }
 
@@ -204,7 +204,7 @@ Task *request2task()
     }
 
     // TODO: move messaging to execute()
-    reply(client, "HTTP/1.1 200 OK", "Hello from Psirver!");
+    // reply(client, "HTTP/1.1 200 OK", "Hello from Psirver!");
     return task;
   }
   

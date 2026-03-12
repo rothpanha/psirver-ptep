@@ -41,7 +41,7 @@ check_endpoint "GET /scripts/<bad_id>/delete" "curl $CURLFLAGS $SERVER/scripts/b
 check_endpoint "GET /scripts/<id>" "curl $CURLFLAGS $SERVER/scripts/355" "400"
 check_endpoint "GET /scripts/<id>/<bad_command>" "curl $CURLFLAGS $SERVER/scripts/355/foobar" "400"
 check_endpoint "GET /scripts/<id>/delete" "curl $CURLFLAGS $SERVER/scripts/355/delete" "200"
-check_endpoint "GET /teapot" "curl $CURLFLAGS $SERVER/teapot" "200"
+check_endpoint "GET /teapot" "curl $CURLFLAGS $SERVER/teapot" "418"
 
 # POST requests
 check_endpoint "POST /<bad_command>" "curl -F \"file=@Makefile\" $CURLFLAGS $SERVER/foobar" "400"
