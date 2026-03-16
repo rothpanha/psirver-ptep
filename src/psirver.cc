@@ -11,8 +11,6 @@
 static constexpr ssize_t MAX_REQUEST_SZ = 0x10000;
 
 static constexpr size_t READ_BUFFER_SZ = 0x1000;
-static constexpr char RN[] = "\r\n";
-static constexpr char END_OF_HEADER[] = "\r\n\r\n";
 
 // Global variables (are evil)
 int server_socket;
@@ -171,32 +169,43 @@ Task *request2task()
     reply(client, "HTTP/1.1 413 Content Too Large", "Content Too Large");
     return nullptr;
   }
+  
+  if(request.compare(0, strlen("GET "), "GET ") == 0) {
+    std::string headers = request.substr(0, header_end_pos);
 
-  if (header_end_pos == std::string::npos) {
-    reply(client, "HTTP/1.1 400 Bad Request", "Bad Request");
-    return nullptr;
+    Task *task = Task::construct(client, headers);
+
+    if(!task) {
+      reply(client, "HTTP/1.1 400 Bad Request", "Bad Request");
+      return nullptr;
+    }
+    
+    return task;
   }
 
-if(request.compare(0, 4, "GET ") == 0) {
-    std::string headers = request.substr(0, header_end_pos  + (sizeof END_OF_HEADER - 1));
-
-    return Task::construct(client, headers); 
-}
-
-if(request.compare(0, 5, "POST ") == 0) {
-    std::string headers = request.substr(0, header_end_pos  + (sizeof END_OF_HEADER - 1));
+  if(request.compare(0, strlen("POST "), "POST ") == 0) {
+    std::string headers = request.substr(0, header_end_pos);
 
     ssize_t content_length = parse_content_length(client, headers);
-    
-    if (content_length < 0) return nullptr;
+      
+    if (content_length < 0) {
+      return nullptr;
+    }
 
     std::string body = request.substr(header_end_pos + sizeof END_OF_HEADER - 1);
     body = read_body(client, content_length, body);
 
-    return Task::construct(client, headers, body);
-}
-  std::string preview = request.substr(0, 0x10) + "...";
-  reply(client, "HTTP/1.1 405 Method Not Allowed", preview.c_str());
+    Task *task = Task::construct(client, headers, body);    
+    if(!task) {
+      reply(client, "HTTP/1.1 400 Bad Request", "Bad Request");
+      return nullptr;
+    }
+
+    return task;
+  }
+  
+  reply(client, "HTTP/1.1 405 Method Not Allowed",
+	(request.substr(0, 0x10) + "...").c_str());
   return nullptr;
 }
 
@@ -205,8 +214,10 @@ if(request.compare(0, 5, "POST ") == 0) {
 // - unlink()
 // - syslog()
 // - exit()
-void on_sigint(int /* sig_num */)
+void graceful_shutdown(int /* sig_num */)
 {
+  Script::terminate_all();
+  
   close(server_socket);
   if (unlink(pid_path.c_str()) != 0) {
     syslog(LOG_WARNING, "Unlink(%s): %s", pid_path.c_str(), strerror(errno));
@@ -232,14 +243,17 @@ int main(int argc, char **argv)
   
   // Register a graceful shutdown handler on SIGINT
   add_sigint_handler();
-  
+
   // The main loop
   while(true) { // Not really, but close
     Task *task = request2task();
     
-    // Main processing will happen here, but now all tasks are nullptrs
+    // Main processing happens here
     if (task) {
-      delete task;
+      // TODO: convert to a call to std::thread(), followed by a call
+      // to detach()
+      task->execute(); // TODO: put in a thread
+      delete task; // TODO: replace
     }
   }
 

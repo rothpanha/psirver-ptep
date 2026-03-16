@@ -3,13 +3,12 @@
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
-#include <syslog.h>
-#include <unistd.h> 
+#include <syslog.h> 
 
 #include "utils.hh"
 
 static constexpr char PID_FILE_NAME[] = "psirver.pid";
-static constexpr char HOME_VAR[] = "PSIRVER_HOME";
+// static constexpr char HOME_VAR[] = "PSIRVER_HOME";
 
 static constexpr uint16_t DEFAULT_PORT = 8000;
 
@@ -27,7 +26,7 @@ void usage(const char* prog)
 // - std::stoi()
 int16_t select_port(int argc, char **argv)
 {
-  int server_port_tmp = DEFAULT_PORT;
+  int16_t server_port_tmp = DEFAULT_PORT;
   if (argc > 2) {		// Too many parameters
     usage(argv[0]);		// No return
   }
@@ -72,11 +71,16 @@ std::string init_pid_file()
     syslog(LOG_ERR, "%s: not set", HOME_VAR);
     exit(EXIT_FAILURE);
   }
+
+  if (::chdir(home) != 0) {
+    syslog(LOG_ERR, "%s: %s", HOME_VAR, strerror(errno));
+    exit(EXIT_FAILURE);
+  }
   
-  std::string pid_file_path;
-  pid_file_path.append(home);
-  pid_file_path.push_back('/');
-  pid_file_path.append(PID_FILE_NAME);
+  std::string pid_file_path(PID_FILE_NAME);
+  // pid_file_path.append(home);
+  // pid_file_path.push_back('/');
+  // pid_file_path.append(PID_FILE_NAME);
     
   int flags = O_WRONLY | O_CREAT | O_TRUNC;
   int mode = S_IWUSR | S_IRUSR | S_IRGRP | S_IROTH;
@@ -107,7 +111,7 @@ void add_sigint_handler()
 {
   struct sigaction sa;
   memset(&sa, 0, sizeof(sa));
-  sa.sa_handler = &on_sigint;
+  sa.sa_handler = graceful_shutdown;
   sigemptyset(&sa.sa_mask);
   
   if(sigaction(SIGINT, &sa, nullptr) != 0) {

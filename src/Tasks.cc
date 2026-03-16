@@ -1,191 +1,413 @@
-#include "Tasks.hh"
+#include <dirent.h>
+#include <cassert>
+#include <syslog.h> 
 #include <algorithm>
-#include <sstream>
-#include <iostream>
-#include <vector>
-#include <string>
+#include <sys/stat.h>
+#include <fstream>
+#include <memory>
+#include <ctime>
+#include <sys/wait.h>
+#include "Tasks.hh"
+#include "utils.hh"
 
-// HTTP protocol and URL parsing constants
-const std::string PREFIX_SCRIPTS = "/scripts/";
-const std::string PREFIX_JOBS = "/jobs/";
-const std::string PREFIX_ARGS = "args=";
-const std::string HEADER_BOUND = "boundary=";
-const std::string HEADER_FNAME = "filename=\"";
-const std::string CRLF_2 = "\r\n\r\n";
+static std::vector<std::unique_ptr<Script>> scripts;
 
-// Checks if a string s starts with the given prefix.
-static bool starts_with(const std::string& s, const std::string& prefix){ 
-    return s.rfind(prefix, 0) == 0; 
-}
-// Extracts the request path from the first line of the HTTP headers.
-static std::string get_path(const std::string& headers){
-  size_t end_line = headers.find('\n');
-  std::string line = headers.substr(0, end_line); 
-  size_t first_space = line.find(' ');
-  if(first_space == std::string::npos) return "";
-  size_t second_space = line.find(' ', first_space + 1);
-  if(second_space == std::string::npos) return "";
-  return line.substr(first_space + 1, second_space - first_space - 1);
-}
-// Parses a numeric ID from the path string
-// Updates end_pos to point to the character after the number.
-// Returns -1 if no number is found.
-static int parse_id(const std::string& path, size_t offset, size_t& end_pos){
-  end_pos = offset;
-  while(end_pos < path.size() && isdigit(path[end_pos])) end_pos++;
-  if(end_pos == offset) return -1;
-  return std::stoi(path.substr(offset, end_pos - offset));
-}
-// Checks if a specific header or substring exists in the headers.
-static bool header_has(const std::string& h, const char* needle){ 
-    auto it = std::search(h.begin(), h.end(), needle, needle + strlen(needle),
-        [](char a, char b) { return std::tolower(a) == std::tolower(b); });
-    return it != h.end();
-}
-// Extracts the boundary parameter from the content-type header.
-static std::string get_boundary(const std::string& h) {
-    size_t pos = h.find(HEADER_BOUND);
-    if(pos == std::string::npos) return "";
-    size_t end = h.find("\r\n", pos);
-    return "--" + h.substr(pos + HEADER_BOUND.length(), end - (pos + HEADER_BOUND.length()));
-}
+// Used for locking and unlocking the `scripts` vector
+static std::mutex script_mutex;
 
-// Decodes URL-encoded characters.
-static std::string url_decode(const std::string& s){
-  std::string ret;
-  for(size_t i=0; i<s.size(); i++){
-    if(s[i] == '+'){ ret += ' '; }
-    else if(s[i] == '%' && i + 2 < s.size()){
-      int code;
-      if(sscanf(s.substr(i+1, 2).c_str(), "%x", &code) == 1){
-          ret += static_cast<char>(code);
-          i += 2;
-      } else ret += s[i];
-    } else { ret += s[i]; }
-  }
-  return ret;
-}
+/**
+ * Delete all uploaded scripts and their storage directories.
+ *
+ * This function iterates over the global `scripts` table and, for each
+ * script entry, reconstructs the corresponding directory path
+ * `SCRIPTS_PATH/<id>` and file path `SCRIPTS_PATH/<id>/<filename>`.
+ * It then attempts to make the directory user-accessible and the file
+ * user-writable, removes the script file, and removes the script's
+ * subdirectory.
+ *
+ * The function performs best-effort cleanup only: it does not check
+ * or report failures from `chmod()`, `remove()`, or `rmdir()`, and it
+ * does not send any client response. Its intended use is bulk
+ * shutdown-time cleanup rather than request-time error handling.
+ *
+ */
 
-int HealthTask::execute(){ 
-  return 0;
-}
-int TeapotTask::execute(){ 
-  return 0; 
-}
-int JobListTask::execute(){
-  return 0; 
-}
-int ScriptListTask::execute(){
-  return 0; 
-}
-int DeleteTask::execute(){ 
-  return 0; 
-}
-int JobStatusTask::execute(){
-  return 0; 
-}
-int TerminateTask::execute(){
-  return 0; 
-}
-int StdoutTask::execute(){ 
-  return 0;
-}
-int StderrTask::execute(){
-  return 0;
-}
-int RunTask::execute(){
-  return 0; 
-}
-int UploadTask::execute(){
-  return 0;
-}
-
-// This function parses the headers and returns one of the GET task
-// objects
-Task *Task::construct(int client, std::string headers)
+void Script::terminate_all()
 {
-  std::string path = get_path(headers);
-  std::cerr << "GET " << path << std::endl; 
-  if(path.empty()) { reply(client, "HTTP/1.1 400 Bad Request", "Bad Request"); return nullptr; }
-
-  if(path == "/health") return new HealthTask(client);
-  if(path == "/teapot") return new TeapotTask(client); 
-  if(path == "/jobs") return new JobListTask(client);
-  if(path == "/scripts") return new ScriptListTask(client);
-
-  if(starts_with(path, PREFIX_SCRIPTS)) {
-      size_t end_pos = 0;
-      int id = parse_id(path, PREFIX_SCRIPTS.length(), end_pos); // Using constant length
-      if(id >= 0 && path.substr(end_pos) == "/delete") return new DeleteTask(client, id);
-      reply(client, "HTTP/1.1 404 Not Found", "Script Not Found");
-      return nullptr;
+  for (std::size_t id = 0 ; id < scripts.size(); ++id) {
+    if(!scripts[id]) {
+      continue;
+    }
+    const std::string script_dir =
+      std::string(SCRIPTS_PATH) + std::to_string(id);
+    const std::string script_filename =
+      script_dir + "/" + scripts[id]->get_name();
+    
+    ::chmod(script_dir.c_str(), S_IRWXU);
+    ::chmod(script_filename.c_str(), S_IWUSR);
+    ::remove(script_filename.c_str());
+    ::rmdir(script_dir.c_str());
   }
-
-  if(starts_with(path, PREFIX_JOBS)) {
-      size_t end_pos = 0;
-      int id = parse_id(path, PREFIX_JOBS.length(), end_pos); // Using constant length
-      if(id < 0) { reply(client, "HTTP/1.1 404 Not Found", "Invalid Job ID"); return nullptr; }
-      std::string suffix = path.substr(end_pos);
-      if(suffix.empty()) return new JobStatusTask(client, id);
-      if(suffix == "/terminate") return new TerminateTask(client, id);
-      if(suffix == "/stdout") return new StdoutTask(client, id);
-      if(suffix == "/stderr") return new StderrTask(client, id);
-  }
-  reply(client, "HTTP/1.1 404 Not Found", "Not Found");
-  return nullptr;
 }
 
-// This function parses the headers and the body returns one of the
-// POST task objects
-Task *Task::construct(int client, std::string headers, std::string body)
+// Do the job, reply to the client, and return to the main loop
+
+int HealthTask::execute()
 {
-  std::string path = get_path(headers);
-  std::cerr << "POST " << path << std::endl;
-  if(path.empty()) { reply(client, "HTTP/1.1 400 Bad Request", "Bad Request"); return nullptr; }
-
-  if(starts_with(path, PREFIX_SCRIPTS)) {
-      size_t end_pos = 0;
-      int id = parse_id(path, PREFIX_SCRIPTS.length(), end_pos);
-      if(id >= 0 && path.substr(end_pos) == "/run") {
-          std::vector<std::string> args;
-          size_t p = body.find(PREFIX_ARGS);
-          if(p != std::string::npos) {
-              std::string raw = url_decode(body.substr(p + PREFIX_ARGS.length())); 
-              std::stringstream ss(raw);
-              std::string segment;
-              while(std::getline(ss, segment, ',')) if(!segment.empty()) args.push_back(segment);
-          }
-          return new RunTask(client, id, args);
-      }
-  }
-
-  if(path == "/scripts" || path == "/scripts/upload") {
-      if(!header_has(headers, "multipart/form-data")) {
-          reply(client, "HTTP/1.1 415 Unsupported Media Type", "Unsupported Media Type");
-          return nullptr;
-      }
-      std::string boundary = get_boundary(headers);
-      if(boundary.empty()) { reply(client, "HTTP/1.1 400 Bad Request", "Missing Boundary"); return nullptr; }
-
-      size_t part_start = body.find(boundary);
-      size_t header_end = body.find(CRLF_2, part_start);
-      if(part_start == std::string::npos || header_end == std::string::npos) {
-           reply(client, "HTTP/1.1 400 Bad Request", "Bad Multipart Format"); return nullptr;
-      }
-
-      std::string part_headers = body.substr(part_start, header_end - part_start);
-      size_t fn_pos = part_headers.find(HEADER_FNAME);
-      if(fn_pos == std::string::npos) { reply(client, "HTTP/1.1 400 Bad Request", "Filename missing"); return nullptr; }
-      fn_pos += HEADER_FNAME.length(); 
-      std::string filename = part_headers.substr(fn_pos, part_headers.find("\"", fn_pos) - fn_pos);
-
-      size_t content_start = header_end + CRLF_2.length(); 
-      size_t content_end = body.find(boundary, content_start);
-      if(content_end == std::string::npos) { reply(client, "HTTP/1.1 400 Bad Request", "End boundary missing"); return nullptr; }
-
-      if(content_end > 2 && body[content_end-2] == '\r' && body[content_end-1] == '\n') content_end -= 2;
-      return new UploadTask(client, filename, body.substr(content_start, content_end - content_start));
-  }
-  reply(client, "HTTP/1.1 404 Not Found", "Not Found");
-  return nullptr;
+  reply(client, "HTTP/1.1 200 OK", "OK");
+  return 0;
 }
+ 
+int TeapotTask::execute()
+{
+  reply(client, "HTTP/1.1 418 I am a teapot", "I am a teapot (maybe)");
+  return 0;
+}
+
+/**
+ * Format this script as one line of the `/scripts` listing.
+ *
+ * The returned line contains three comma-separated fields: the
+ * numeric script ID, the original script filename, and the file's
+ * last modification timestamp (`mtime`) formatted as `MM/DD/YYYY
+ * HH:mm:ss` in local time. The method obtains `mtime` by calling
+ * `stat()` on the script file located at `SCRIPTS_PATH/<id>/<name>`.
+ *
+ * If the file cannot be stat'ed, the method returns an empty string.
+ *
+ * The timestamp is initialized to `"00/00/0000 00:00:00"` and is
+ * replaced with the formatted local modification time if that time
+ * can be converted successfully via `localtime_r()`. If local-time
+ * conversion fails, the method still returns a valid listing line,
+ * but with the default placeholder timestamp.
+ *
+ * @return A comma-separated listing line for this script, or an empty
+ *         string on failure.
+ */
+
+const std::string Script::format() const
+{
+  const std::string script_filename =
+    std::string(SCRIPTS_PATH) + std::to_string(script_id) + "/" + name;
+  
+  struct stat st;
+  if (::stat(script_filename.c_str(), &st) != 0) {
+    return "";
+  }
+  
+  char buf[20] = "00/00/0000 00:00:00";
+  std::tm tm_result;
+  if (::localtime_r(&st.st_mtime, &tm_result) != nullptr) {
+    ::strftime(buf, sizeof(buf), "%m/%d/%Y %H:%M:%S", &tm_result);
+  }
+  
+  return std::to_string(script_id) + ',' + name + ',' + buf;
+}
+
+/**
+ * Roll back a failed script upload and report the failure to the client.
+ *
+ * This helper removes the in-memory script entry identified by `which`,
+ * logs the failure to syslog together with the current `errno` message,
+ * attempts to delete the partially created script file from
+ * `SCRIPTS_PATH/<which>/<filename>`, and sends an HTTP 500 response to the
+ * client.
+ *
+ * The file removal is best-effort: failure to delete the file is ignored.
+ * The directory itself is not removed by this method.
+ *
+ * The `msg` argument supplies context for the log entry, typically the path
+ * or operation that failed.
+ *
+ * @param which Index of the script slot to clear from the global `scripts`
+ *              table.
+ * @param msg   Context string to include in the error log.
+ */
+
+void UploadTask::cleanup(std::size_t which, const std::string &msg)
+{
+  scripts[which].reset();
+  
+  const std::string script_filename =
+    std::string(SCRIPTS_PATH) + std::to_string(which) + "/" + filename;
+  
+  syslog(LOG_ERR, "%s: %s", msg.c_str(), strerror(errno));
+  ::remove(script_filename.c_str()); // OK to fail
+  reply(client, "HTTP/1.1 500 Internal Server Error",
+	"Internal Server Error");
+}
+
+/**
+ * Upload the current script to the server-side script repository.
+ *
+ * This method assigns the uploaded script the smallest non-negative
+ * available script ID, stores metadata for that script in the global
+ * `scripts` table, and writes the script body to the corresponding file
+ * under `SCRIPTS_PATH/<script_id>/`.
+ *
+ * The method first locates the first empty slot in `scripts`; if no such
+ * slot exists, it appends a new entry. It then ensures that the target
+ * script directory exists and is temporarily writable by the user. If the
+ * directory does not exist, it is created; if it exists but is not a
+ * directory, the upload fails.
+ *
+ * The script contents are written to a file named `filename` inside that
+ * directory. If the file already exists and cannot be opened because it is
+ * read-only, the method attempts to restore user write permission and retry
+ * the open. After a successful write, the file permissions are restricted
+ * to user-read only, and the directory permissions are restricted to
+ * user-read and user-execute only.
+ *
+ * On success, the method sends an HTTP 200 response whose body contains the
+ * assigned script ID and returns 0.
+ *
+ * On any failure, the method invokes `cleanup()` to remove partially written
+ * state, sends an HTTP 500 response, and returns 1.
+ *
+ * @return 0 on success; 1 on failure.
+ */
+
+ int UploadTask::execute()
+{
+  // TODO: lock `script_mutex`
+
+  // Find the next available script ID
+  std::size_t script_id = 0;
+  for (; script_id < scripts.size() && scripts[script_id]; ++script_id) {
+    // Do nothing
+  }
+
+  Script *s = new Script(script_id, filename);
+  if(script_id == scripts.size()) {
+    scripts.emplace_back(s);
+  } else {
+    scripts[script_id].reset(s);
+  }
+  
+  // TODO: unlock `script_mutex`
+
+  const std::string script_dir =
+    std::string(SCRIPTS_PATH) + std::to_string(script_id);
+  const std::string script_filename = script_dir + "/" + filename;
+
+  // If the directory already exists, make it writable
+  // Else, create it
+  struct stat st;
+  if (::stat(script_dir.c_str(), &st) == 0) {
+    if (!S_ISDIR(st.st_mode)) {
+      cleanup(script_id, script_dir + " not a directory");
+      return 1;
+    }
+    if (::chmod(script_dir.c_str(), S_IRWXU) != 0) {
+      cleanup(script_id, script_dir);
+      return 1;
+    }
+  } else {  
+    if (::mkdir(script_dir.c_str(), S_IRWXU) != 0) {
+      cleanup(script_id, script_dir);
+      return 1;
+    }
+  }
+
+  {
+    // Create the script file
+    std::ofstream out(script_filename.c_str(), std::ios::out | std::ios::trunc);
+    if (!out) {
+      // The script file may already exist and be read-only
+      ::chmod(script_filename.c_str(), S_IWUSR);
+      out.clear();
+      out.open(script_filename.c_str(), std::ios::out | std::ios::trunc);
+      if(!out) {
+	cleanup(script_id, script_filename);
+	return 1;
+      }
+    }
+    
+    out << script;
+    if (!out) {
+      cleanup(script_id, script_filename);
+      return 1;
+    }
+  } // close file before chmod
+  
+  // Make the file read-only
+  if (::chmod(script_filename.c_str(), S_IRUSR) != 0) {
+    cleanup(script_id, script_filename);
+    return 1;
+  }
+  
+  // Make the directory read-only
+  if(::chmod(script_dir.c_str(), S_IRUSR | S_IXUSR) != 0) {
+    cleanup(script_id, script_dir);
+    return 1;
+  }
+  
+  reply(client, "HTTP/1.1 200 OK", std::to_string(script_id).c_str());
+  return 0;
+}
+
+/**
+ * Return the current script listing to the client.
+ *
+ * This method scans the global `scripts` table in increasing order of
+ * script ID and builds a plain-text listing of all currently
+ * registered scripts. Each non-null script entry contributes one
+ * output line produced by `Script::format()`. Non-empty formatted
+ * lines are appended to the response body, separated by newline
+ * characters.
+ *
+ * If no scripts are currently registered, the response body is empty.
+ * In both the empty and non-empty cases, the method replies with
+ * HTTP status 200 OK.
+ *
+ * Concurrency note:
+ * Iteration over the shared `scripts` table must be protected by the
+ * surrounding lock so that the listing reflects a consistent snapshot.
+ *
+ * @return Always returns 0.
+ */
+
+int ScriptListTask::execute()
+{
+  std::string listing;
+
+  // TODO: lock `script_mutex`
+
+  for (std::size_t i = 0; i < scripts.size(); ++i) {
+    if (scripts[i]) {
+      const std::string line = scripts[i]->format();
+      if (!line.empty()) {
+	listing += line + "\n";
+      }
+    }
+  }
+  
+  // TODO: unlock `script_mutex`
+  
+  reply(client, "HTTP/1.1 200 OK", listing.c_str());
+  return 0;
+}
+
+/**
+ * Delete a previously uploaded script.
+ *
+ * This method handles the `/scripts/<id>/delete` endpoint. It first
+ * checks whether `script_id` designates an existing script entry in
+ * the global `scripts` table. If the ID is out of range or the
+ * corresponding slot is empty, the method replies with HTTP 404 Not
+ * Found and returns 1.
+ *
+ * For an existing script, the method removes the in-memory metadata
+ * entry from `scripts`.
+ *
+ * After releasing the lock, the method restores write/search
+ * permissions as needed, deletes the script file, and removes the
+ * script subdirectory. If any filesystem operation fails, the method
+ * logs the error with `syslog`, replies with HTTP 500 Internal Server
+ * Error, and returns 1.
+ *
+ * On success, the method replies with HTTP 200 OK and returns the
+ * deleted script ID as the response body.
+ *
+ * Concurrency note: Access to the shared `scripts` table must be
+ * protected by the surrounding lock so that existence checking and
+ * removal of the in-memory entry are atomic with respect to other
+ * tasks.
+ *
+ * @return 0 on success; 1 if the script does not exist or if deletion
+ * fails.
+ */
+
+int DeleteTask::execute()
+{
+  // TODO: lock `script_mutex`
+  
+  if (script_id >= scripts.size() || !scripts[script_id]) {
+    // TODO: unlock `script_mutex`
+    reply(client, "HTTP/1.1 404 Not Found", "Not Found");
+    return 1;
+  }
+
+  const std::string script_dir =
+    std::string(SCRIPTS_PATH) + std::to_string(script_id);
+  const std::string script_filename =
+    script_dir + "/" + scripts[script_id]->get_name();
+
+  scripts[script_id].reset();
+
+  // TODO: unlock `script_mutex`
+
+  if (   ::chmod(script_dir.c_str(), S_IRWXU) != 0
+      || ::chmod(script_filename.c_str(), S_IWUSR) != 0
+      || ::remove(script_filename.c_str()) != 0
+      || ::rmdir(script_dir.c_str()) != 0) {
+    syslog(LOG_ERR, "%s: %s", script_filename.c_str(), strerror(errno));
+    reply(client, "HTTP/1.1 500 Internal Server Error",
+          "Internal Server Error");
+    return 1;
+  }
+
+  reply(client, "HTTP/1.1 200 OK", std::to_string(script_id).c_str());
+  return 0;
+}
+
+// The tasks above are ready to be executed --------------------------
+
+int RunTask::execute()
+{
+  if(scripts[script_id] == nullptr) {
+    reply(client, "HTTP/1.1 404 Not found", "Not found");
+    return 1;
+  }
+
+  const std::string script_dir =
+      std::string(SCRIPTS_PATH) + std::to_string(script_id);
+  const std::string script_filename =
+    script_dir + "/" + scripts[script_id]->get_name();
+
+  // TODO 
+    
+  reply(client, "HTTP/1.1 200 OK", "OK");
+  return 0;
+}
+
+int JobListTask::execute()
+{
+  // --> To be implemented later
+  std::cerr << "I will report list of jobs\n";
+  reply(client, "HTTP/1.1 200 OK", "OK");
+  return 0;
+}
+
+int JobStatusTask::execute()
+{
+  // --> To be implemented later
+  std::cerr << "I will report status of job " << job_id << "\n";
+  reply(client, "HTTP/1.1 200 OK", "OK");
+  return 0;
+};
+
+int TerminateTask::execute()
+{
+  // --> To be implemented later
+  std::cerr << "I will terminate job " << job_id << "\n";
+  reply(client, "HTTP/1.1 200 OK", "OK");
+  return 0;
+}
+
+int StderrTask::execute()
+{
+  // --> To be implemented later
+  std::cerr << "I will report stderr of job " << job_id << "\n";
+  reply(client, "HTTP/1.1 200 OK", "OK");
+  return 0;
+}
+
+int StdoutTask::execute()
+{
+  // --> To be implemented later
+  std::cerr << "I will report stdout of job " << job_id << "\n";
+  reply(client, "HTTP/1.1 200 OK", "OK");
+  return 0;
+} 
+
