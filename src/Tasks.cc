@@ -169,22 +169,22 @@ void UploadTask::cleanup(std::size_t which, const std::string &msg)
 
  int UploadTask::execute()
 {
-  // TODO: lock `script_mutex`
-
   // Find the next available script ID
   std::size_t script_id = 0;
-  for (; script_id < scripts.size() && scripts[script_id]; ++script_id) {
-    // Do nothing
-  }
-
-  Script *s = new Script(script_id, filename);
-  if(script_id == scripts.size()) {
-    scripts.emplace_back(s);
-  } else {
-    scripts[script_id].reset(s);
-  }
+  {
+    std::lock_guard<std::mutex>lock(script_mutex);
   
-  // TODO: unlock `script_mutex`
+    for (; script_id < scripts.size() && scripts[script_id]; ++script_id) {
+      // Do nothing
+    }
+
+    Script *s = new Script(script_id, filename);
+    if(script_id == scripts.size()) {
+      scripts.emplace_back(s);
+    } else {
+      scripts[script_id].reset(s);
+    }
+  }
 
   const std::string script_dir =
     std::string(SCRIPTS_PATH) + std::to_string(script_id);
@@ -270,19 +270,18 @@ void UploadTask::cleanup(std::size_t which, const std::string &msg)
 int ScriptListTask::execute()
 {
   std::string listing;
+  {
+    std::lock_guard<std::mutex> lock(script_mutex);
 
-  // TODO: lock `script_mutex`
-
-  for (std::size_t i = 0; i < scripts.size(); ++i) {
-    if (scripts[i]) {
-      const std::string line = scripts[i]->format();
-      if (!line.empty()) {
-	listing += line + "\n";
+    for (std::size_t i = 0; i < scripts.size(); ++i) {
+      if (scripts[i]) {
+        const std::string line = scripts[i]->format();
+        if (!line.empty()) {
+          listing += line + "\n";
+        }
       }
     }
   }
-  
-  // TODO: unlock `script_mutex`
   
   reply(client, "HTTP/1.1 200 OK", listing.c_str());
   return 0;
@@ -320,22 +319,21 @@ int ScriptListTask::execute()
 
 int DeleteTask::execute()
 {
-  // TODO: lock `script_mutex`
-  
-  if (script_id >= scripts.size() || !scripts[script_id]) {
-    // TODO: unlock `script_mutex`
-    reply(client, "HTTP/1.1 404 Not Found", "Not Found");
-    return 1;
-  }
-
+  std::string script_filename;
   const std::string script_dir =
     std::string(SCRIPTS_PATH) + std::to_string(script_id);
-  const std::string script_filename =
-    script_dir + "/" + scripts[script_id]->get_name();
 
-  scripts[script_id].reset();
+  {
+    std::lock_guard<std::mutex> lock(script_mutex);
 
-  // TODO: unlock `script_mutex`
+    if (script_id >= scripts.size() || !scripts[script_id]) {
+      reply(client, "HTTP/1.1 404 Not Found", "Not Found");
+      return 1;
+    }
+
+    script_filename = script_dir + "/" + scripts[script_id]->get_name();
+    scripts[script_id].reset();
+  }
 
   if (   ::chmod(script_dir.c_str(), S_IRWXU) != 0
       || ::chmod(script_filename.c_str(), S_IWUSR) != 0
@@ -355,17 +353,48 @@ int DeleteTask::execute()
 
 int RunTask::execute()
 {
-  if(scripts[script_id] == nullptr) {
-    reply(client, "HTTP/1.1 404 Not found", "Not found");
+  std::string script_filename;
+  {
+    std::lock_guard<std::mutex> lock(script_mutex);
+
+    if(script_id >= scripts.size() || scripts[script_id] == nullptr) {
+      reply(client, "HTTP/1.1 404 Not found", "Not found");
+      return 1;
+    }
+
+    const std::string script_dir =
+        std::string(SCRIPTS_PATH) + std::to_string(script_id);
+    script_filename = script_dir + "/" + scripts[script_id]->get_name();
+  }
+
+  pid_t pid = ::fork();
+  if (pid < 0) {
+    syslog(LOG_ERR, "fork: %s", strerror(errno));
+    reply(client, "HTTP/1.1 500 Internal Server Error", "Internal Server Error");
     return 1;
   }
 
-  const std::string script_dir =
-      std::string(SCRIPTS_PATH) + std::to_string(script_id);
-  const std::string script_filename =
-    script_dir + "/" + scripts[script_id]->get_name();
+  if (pid == 0) {
+    // child process: execute Python with the script filename and args
+    std::vector<char *> argv;
+    argv.push_back(const_cast<char *>("python"));
+    argv.push_back(const_cast<char *>(script_filename.c_str()));
+    for (std::size_t i = 0; i < args.size(); ++i) {
+      argv.push_back(const_cast<char *>(args[i].c_str()));
+    }
+    argv.push_back(nullptr);
 
-  // TODO 
+    ::execvp("python", argv.data());
+    // if execvp returns, it failed
+    ::exit(EXIT_FAILURE);
+  }
+
+  // parent process: wait for child to terminate
+  if (::wait4(pid, nullptr, 0, nullptr) < 0) {
+    syslog(LOG_ERR, "wait4: %s", strerror(errno));
+    reply(client, "HTTP/1.1 500 Internal Server Error", "Internal Server Error");
+    return 1;
+  } 
     
   reply(client, "HTTP/1.1 200 OK", "OK");
   return 0;

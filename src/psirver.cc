@@ -3,6 +3,7 @@
 #include <string>
 #include <syslog.h> 
 #include <unistd.h>
+#include <thread>
 
 #include "utils.hh"
 #include "Tasks.hh"
@@ -250,10 +251,8 @@ int main(int argc, char **argv)
     
     // Main processing happens here
     if (task) {
-      // TODO: convert to a call to std::thread(), followed by a call
-      // to detach()
-      task->execute(); // TODO: put in a thread
-      delete task; // TODO: replace
+        std::thread t(&Task::execute_in_thread, task);
+        t.detach();
     }
   }
 

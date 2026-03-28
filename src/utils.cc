@@ -3,7 +3,8 @@
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
-#include <syslog.h> 
+#include <syslog.h>
+#include <unistd.h> 
 
 #include "utils.hh"
 
