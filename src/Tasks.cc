@@ -1,19 +1,16 @@
-#include <dirent.h>
-#include <cassert>
 #include <syslog.h> 
-#include <algorithm>
 #include <sys/stat.h>
 #include <fstream>
-#include <memory>
-#include <ctime>
-#include <sys/wait.h>
-#include "Tasks.hh"
-#include "utils.hh"
 
-static std::vector<std::unique_ptr<Script>> scripts;
+#include "utils.hh"
+#include "Tasks.hh"
+#include "Jobs.hh"
+static constexpr char SCRIPTS_PATH[] = "scripts/";
+
+std::vector<std::unique_ptr<Script>> Script::scripts(1);
 
 // Used for locking and unlocking the `scripts` vector
-static std::mutex script_mutex;
+std::mutex Script::Script::mutex;
 
 /**
  * Delete all uploaded scripts and their storage directories.
@@ -34,14 +31,14 @@ static std::mutex script_mutex;
 
 void Script::terminate_all()
 {
-  for (std::size_t id = 0 ; id < scripts.size(); ++id) {
-    if(!scripts[id]) {
+  for (std::size_t id = 0 ; id < Script::scripts.size(); ++id) {
+    if(!Script::scripts[id]) {
       continue;
     }
     const std::string script_dir =
       std::string(SCRIPTS_PATH) + std::to_string(id);
     const std::string script_filename =
-      script_dir + "/" + scripts[id]->get_name();
+      script_dir + "/" + Script::scripts[id]->get_name();
     
     ::chmod(script_dir.c_str(), S_IRWXU);
     ::chmod(script_filename.c_str(), S_IWUSR);
@@ -85,7 +82,7 @@ int TeapotTask::execute()
  *         string on failure.
  */
 
-const std::string Script::format() const
+std::string Script::format() const
 {
   const std::string script_filename =
     std::string(SCRIPTS_PATH) + std::to_string(script_id) + "/" + name;
@@ -126,7 +123,7 @@ const std::string Script::format() const
 
 void UploadTask::cleanup(std::size_t which, const std::string &msg)
 {
-  scripts[which].reset();
+  Script::scripts[which].reset();
   
   const std::string script_filename =
     std::string(SCRIPTS_PATH) + std::to_string(which) + "/" + filename;
@@ -167,24 +164,25 @@ void UploadTask::cleanup(std::size_t which, const std::string &msg)
  * @return 0 on success; 1 on failure.
  */
 
- int UploadTask::execute()
+int UploadTask::execute()
 {
-  // Find the next available script ID
-  std::size_t script_id = 0;
-  {
-    std::lock_guard<std::mutex>lock(script_mutex);
-  
-    for (; script_id < scripts.size() && scripts[script_id]; ++script_id) {
-      // Do nothing
-    }
+  Script::mutex.lock();
 
-    Script *s = new Script(script_id, filename);
-    if(script_id == scripts.size()) {
-      scripts.emplace_back(s);
-    } else {
-      scripts[script_id].reset(s);
-    }
+  // Find the next available POSITIVE script ID
+  std::size_t script_id = 1;
+  for (; script_id < Script::scripts.size() && Script::scripts[script_id];
+       ++script_id) {
+    // Do nothing
   }
+
+  Script *s = new Script(script_id, filename);
+  if(script_id == Script::scripts.size()) {
+    Script::scripts.emplace_back(s);
+  } else {
+    Script::scripts[script_id].reset(s);
+  }
+  
+  Script::mutex.unlock();
 
   const std::string script_dir =
     std::string(SCRIPTS_PATH) + std::to_string(script_id);
@@ -270,19 +268,24 @@ void UploadTask::cleanup(std::size_t which, const std::string &msg)
 int ScriptListTask::execute()
 {
   std::string listing;
-  {
-    std::lock_guard<std::mutex> lock(script_mutex);
 
-    for (std::size_t i = 0; i < scripts.size(); ++i) {
-      if (scripts[i]) {
-        const std::string line = scripts[i]->format();
-        if (!line.empty()) {
-          listing += line + "\n";
-        }
+  {
+    std::lock_guard<std::mutex> lock(Script::mutex);
+
+    for (std::size_t i = 1; i < Script::scripts.size(); ++i) {
+      Script* script = Script::scripts[i].get();
+      if (!script) {
+        continue;
+      }
+
+      std::string line = script->format();
+      if (!line.empty()) {
+        listing += line;
+        listing += '\n';
       }
     }
   }
-  
+
   reply(client, "HTTP/1.1 200 OK", listing.c_str());
   return 0;
 }
@@ -319,124 +322,189 @@ int ScriptListTask::execute()
 
 int DeleteTask::execute()
 {
+  std::unique_ptr<Script> removed_script;
+  std::string script_dir;
   std::string script_filename;
-  const std::string script_dir =
-    std::string(SCRIPTS_PATH) + std::to_string(script_id);
 
   {
-    std::lock_guard<std::mutex> lock(script_mutex);
+    std::lock_guard<std::mutex> lock(Script::mutex);
 
-    if (script_id >= scripts.size() || !scripts[script_id]) {
+    if (script_id >= Script::scripts.size() || !Script::scripts[script_id]) {
       reply(client, "HTTP/1.1 404 Not Found", "Not Found");
       return 1;
     }
 
-    script_filename = script_dir + "/" + scripts[script_id]->get_name();
-    scripts[script_id].reset();
-  }
+    Script* script = Script::scripts[script_id].get();
 
-  if (   ::chmod(script_dir.c_str(), S_IRWXU) != 0
-      || ::chmod(script_filename.c_str(), S_IWUSR) != 0
-      || ::remove(script_filename.c_str()) != 0
-      || ::rmdir(script_dir.c_str()) != 0) {
+    if (script->n_jobs > 0) {
+      reply(client, "HTTP/1.1 425 Too Early", "Script still has running jobs");
+      return 1;
+    }
+
+    script_dir = std::string(SCRIPTS_PATH) + std::to_string(script_id);
+    script_filename = script_dir + "/" + script->get_name();
+
+    // Make the script unavailable immediately so no new jobs can start.
+    removed_script = std::move(Script::scripts[script_id]);
+  }
+  
+  if (::chmod(script_dir.c_str(), S_IRWXU) != 0 ||
+      ::chmod(script_filename.c_str(), S_IWUSR) != 0 ||
+      ::remove(script_filename.c_str()) != 0 ||
+      ::rmdir(script_dir.c_str()) != 0) {
     syslog(LOG_ERR, "%s: %s", script_filename.c_str(), strerror(errno));
-    reply(client, "HTTP/1.1 500 Internal Server Error",
-          "Internal Server Error");
-    return 1;
   }
 
   reply(client, "HTTP/1.1 200 OK", std::to_string(script_id).c_str());
   return 0;
 }
 
-// The tasks above are ready to be executed --------------------------
+// Main program
+//    |
+//    | creates
+//    v
+//  Job object -------------------- launches ------------------> Child process
+//    |                                                          (runs script)
+//    |
+//    +--> stdout reader thread  <--------- stdout pipe ---------+
+//    |
+//    +--> stderr reader thread  <--------- stderr pipe ---------+
+//    |
+//    +--> timer thread ---------(timeout -> terminate child)----+
+//    |
+//    +--> monitor thread -------(waitpid -> final status)-------+
 
 int RunTask::execute()
 {
+  Script* script = nullptr;
   std::string script_filename;
-  {
-    std::lock_guard<std::mutex> lock(script_mutex);
 
-    if(script_id >= scripts.size() || scripts[script_id] == nullptr) {
-      reply(client, "HTTP/1.1 404 Not found", "Not found");
+  {
+    std::lock_guard<std::mutex> lock(Script::mutex);
+    
+    if (script_id >= Script::scripts.size() || !Script::scripts[script_id]) {
+      reply(client, "HTTP/1.1 404 Not Found", "Not Found");
       return 1;
     }
-
-    const std::string script_dir =
-        std::string(SCRIPTS_PATH) + std::to_string(script_id);
-    script_filename = script_dir + "/" + scripts[script_id]->get_name();
-  }
-
-  pid_t pid = ::fork();
-  if (pid < 0) {
-    syslog(LOG_ERR, "fork: %s", strerror(errno));
-    reply(client, "HTTP/1.1 500 Internal Server Error", "Internal Server Error");
-    return 1;
-  }
-
-  if (pid == 0) {
-    // child process: execute Python with the script filename and args
-    std::vector<char *> argv;
-    argv.push_back(const_cast<char *>("python"));
-    argv.push_back(const_cast<char *>(script_filename.c_str()));
-    for (std::size_t i = 0; i < args.size(); ++i) {
-      argv.push_back(const_cast<char *>(args[i].c_str()));
-    }
-    argv.push_back(nullptr);
-
-    ::execvp("python", argv.data());
-    // if execvp returns, it failed
-    ::exit(EXIT_FAILURE);
-  }
-
-  // parent process: wait for child to terminate
-  if (::wait4(pid, nullptr, 0, nullptr) < 0) {
-    syslog(LOG_ERR, "wait4: %s", strerror(errno));
-    reply(client, "HTTP/1.1 500 Internal Server Error", "Internal Server Error");
-    return 1;
-  } 
     
-  reply(client, "HTTP/1.1 200 OK", "OK");
-  return 0;
-}
+    script = Script::scripts[script_id].get();
+    script_filename =
+      std::string(SCRIPTS_PATH) + std::to_string(script_id) + "/" +
+      script->get_name();
+    
+    ++script->n_jobs;
+  }
+  
+  auto launched = Job::launch(script, script_filename, args);
+  JobLaunchResult launch_result = launched.first;
+  Job* job = launched.second;
+ 
+  switch (launch_result) {
+  case JobLaunchResult::OK: {
+    const std::string location =
+      "Location: /jobs/" + std::to_string(job->get_pid());
+    reply(client, "HTTP/1.1 303 See Other", location.c_str(), location.c_str());
+    return 0;
+  }
+    
+  case JobLaunchResult::TOO_MANY_JOBS:
+    --script->n_jobs;
+    reply(client, "HTTP/1.1 503 Service Unavailable", "Too many jobs");
+    return 1;
+    
+  case JobLaunchResult::PIPE_ERROR:
+  case JobLaunchResult::FORK_ERROR:
+    --script->n_jobs;
+    reply(client, "HTTP/1.1 500 Internal Server Error",
+	  "Internal Server Error");
+    return 1;
+  }
 
-int JobListTask::execute()
-{
-  // --> To be implemented later
-  std::cerr << "I will report list of jobs\n";
-  reply(client, "HTTP/1.1 200 OK", "OK");
-  return 0;
+  --script->n_jobs;
+  reply(client, "HTTP/1.1 500 Internal Server Error", "Internal Server Error");
+  return 1;
 }
 
 int JobStatusTask::execute()
 {
-  // --> To be implemented later
-  std::cerr << "I will report status of job " << job_id << "\n";
-  reply(client, "HTTP/1.1 200 OK", "OK");
+  // 1. Lock Job::mutex.
+  // 2. Search for job_id in Job::jobs.
+  // 3. If not found, reply 404 Not Found and return.
+  // 4. If found, save a pointer to the corresponding Job.
+  // 5. Unlock Job::mutex.
+  // 6. Call job->get_status() and convert the result to a string:
+  //    RUNNING, FAILED, TERMINATED, TIMED_OUT, OUTPUT_LIMITED,
+  //    or the numeric exit code if the status is FINISHED.
+  // 7. Obtain the corresponding Script with job->get_script().
+  // 8. Build the response body as "script_id,status".
+  // 9. Reply with HTTP/1.1 200 OK and that body.
+  
+  reply(client, "HTTP/1.1 200 OK", "355,FAILED");
   return 0;
+
 };
+
+int JobListTask::execute()
+{
+  // 1. Atomically (using Job::mutex):
+  // 2. Iterate over all entries in Job::jobs.
+  // 3. For each entry:
+  //    - obtain the job ID from the map key
+  //    - obtain the Job object
+  //    - obtain the corresponding Script with job->get_script()
+  //    - append one line in the format
+  //      "job_id,script_id,script_name\n"
+  
+  reply(client, "HTTP/1.1 200 OK", "12345,355,missing.py\n");
+  return 0;
+}
 
 int TerminateTask::execute()
 {
-  // --> To be implemented later
-  std::cerr << "I will terminate job " << job_id << "\n";
+  // 1. Atomically (using Lock Job::mutex):
+  // 2. Search for job_id in Job::jobs.
+  // 3. If not found, reply 404 Not Found and return.
+  // 4. Call job->terminate() to stop the job.
+  
   reply(client, "HTTP/1.1 200 OK", "OK");
   return 0;
 }
 
 int StderrTask::execute()
 {
-  // --> To be implemented later
-  std::cerr << "I will report stderr of job " << job_id << "\n";
-  reply(client, "HTTP/1.1 200 OK", "OK");
+  // 1. Atomically (using Job::mutex):
+  // 2. Search for job_id in Job::jobs.
+  // 3. If not found, reply 404 Not Found and return.
+  // 4. Obtain the job's standard-error output by calling job->get_stderr().
+  
+  reply(client, "HTTP/1.1 200 OK", "Mary had a little lamb");
   return 0;
 }
 
 int StdoutTask::execute()
 {
-  // --> To be implemented later
-  std::cerr << "I will report stdout of job " << job_id << "\n";
+  // 1. Atomically (using Job::mutex):
+  // 2. Search for job_id in Job::jobs.
+  // 3. If not found, reply 404 Not Found and return.
+  // 4. Obtain the job's standard output by calling job->get_stdout().
+
+  reply(client, "HTTP/1.1 200 OK", "Its fleece was white as snow");
+  return 0;
+}
+
+int PurgeJobTask::execute()
+{
+  // 1. Lock Job::mutex.
+  // 2. Search for job_id in Job::jobs.
+  // 3. If not found, reply 404 Not Found and return.
+  // 4. If found:
+  //    - save a pointer to the corresponding Script
+  //    - move the Job object out of the map into a local std::unique_ptr<Job>
+  //    - erase the map entry
+  // 5. Unlock Job::mutex.
+  // 6. If the removed job is still RUNNING, terminate it.
+  // 8. Decrement script->n_jobs (the variable is "atomic")
+      
   reply(client, "HTTP/1.1 200 OK", "OK");
   return 0;
-} 
-
+}

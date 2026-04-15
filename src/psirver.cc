@@ -3,14 +3,13 @@
 #include <string>
 #include <syslog.h> 
 #include <unistd.h>
-#include <thread>
 
 #include "utils.hh"
 #include "Tasks.hh"
+#include "Jobs.hh"
 
 // Configuration options and other constants
 static constexpr ssize_t MAX_REQUEST_SZ = 0x10000;
-
 static constexpr size_t READ_BUFFER_SZ = 0x1000;
 
 // Global variables (are evil)
@@ -20,23 +19,30 @@ std::string pid_path;
 // Reply to the client with an HTTP status line and a human-readable
 // response body. Library functions used:
 // - std::to_string()
-void reply(int client, const char *status_line, const char *body)
+void reply(int client, const char *status_line, const char *body,
+	   const char *extra)
 {
-  std::string headers;
-  headers.reserve(256);
-  headers.append(status_line);
-  headers.append(RN);
-  headers.append("Content-Type: text/plain; charset=utf-8");
-  headers.append(RN);
-  headers.append("Content-Length: ");
-  headers.append(std::to_string(strlen(body)));
-  headers.append(RN);
-  headers.append("Connection: close");
-  headers.append(END_OF_HEADER);
+  const size_t body_len = std::strlen(body);
+  
+  std::string response;
+  response.reserve(256 + body_len);
+  response.append(status_line);
+  response.append(RN);
+  response.append("Content-Type: text/plain; charset=utf-8");
+  response.append(RN);
+  response.append("Content-Length: ");
+  response.append(std::to_string(body_len));
+  response.append(RN);
+  response.append("Connection: close");
+  if (extra) {
+    response.append(RN);
+    response.append(extra);
+  }
+  response.append(END_OF_HEADER);
+  response.append(body, body_len);
 
-  write(client, headers.data(), headers.size());
-  write(client, body, strlen(body));
-  close(client);
+  ::write(client, response.data(), response.size());
+  ::close(client);
 }
 
 // Open the main server socket and prepare it for accepting
@@ -49,32 +55,35 @@ void reply(int client, const char *status_line, const char *body)
 
 int init_socket(uint16_t port)
 {
-  server_socket = socket(AF_INET, SOCK_STREAM, 0);
+  server_socket = ::socket(AF_INET, SOCK_STREAM, 0);
   if (server_socket < 0) {
     syslog(LOG_ERR, "Socket: %s", strerror(errno));
     return -1;
   }
-    
+
+  int opt = 1;
+  ::setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+  
   struct sockaddr_in server_addr{};
   server_addr.sin_family = AF_INET;           // IPv4
   server_addr.sin_addr.s_addr = htonl(INADDR_ANY); // Bind to all available interfaces
   server_addr.sin_port = htons(port);         // Set the port
 
-  if (bind(server_socket, reinterpret_cast<sockaddr *>(&server_addr),
+  if (::bind(server_socket, reinterpret_cast<sockaddr *>(&server_addr),
 	   sizeof(server_addr)) < 0) {
     syslog(LOG_ERR, "Bind: %s", strerror(errno));
-    close(server_socket);
+    ::close(server_socket);
     return -1;
   }
   
-  if (listen(server_socket, SOMAXCONN) != 0) {
+  if (::listen(server_socket, SOMAXCONN) != 0) {
     syslog(LOG_ERR, "Listen: %s", strerror(errno));
-    close(server_socket);
+    ::close(server_socket);
     return -1;
   }
 
   // Prevent leaking server_socket into child processes
-  if(-1 == fcntl(server_socket, F_SETFD, FD_CLOEXEC)) {
+  if(-1 == ::fcntl(server_socket, F_SETFD, FD_CLOEXEC)) {
     syslog(LOG_WARNING, "fcntl: %s", strerror(errno));
   }
   
@@ -103,7 +112,13 @@ static ssize_t parse_content_length(int client, std::string headers)
   
   std::string content_length_str = headers.substr(pos + sizeof CL - 1,
 						  content_length_end);
-  size_t content_length = std::stoi(content_length_str);
+  size_t content_length;
+  try {
+    content_length = std::stoi(content_length_str);
+  } catch (...) {
+    reply(client, "HTTP/1.1 400 Bad Request", "Bad Request");
+    return -1;    
+  }
   
   if (content_length > MAX_REQUEST_SZ) {
     reply(client, "HTTP/1.1 413 Content Too Large", "Content Too Large");
@@ -118,15 +133,19 @@ static ssize_t parse_content_length(int client, std::string headers)
 // - read()
 std::string read_body(int client, ssize_t content_length, std::string body)
 {
-  size_t remaining = content_length - body.length();
+  if (body.size() < static_cast<size_t>(content_length)) {
+    body.reserve(content_length);
+  }
   
+  size_t remaining = static_cast<size_t>(content_length) - body.length(); 
   char buffer[READ_BUFFER_SZ];
+  
   while (remaining > 0) {
-    ssize_t read_len = std::min((ssize_t)remaining, (ssize_t)sizeof(buffer));
-    ssize_t chunk_sz = read(client, buffer, read_len);
+    const size_t to_read = std::min(remaining, sizeof(buffer));
+    const ssize_t chunk_sz = ::read(client, buffer, to_read);
     if (chunk_sz > 0) {
-      body.append(buffer, chunk_sz);
-      remaining -= chunk_sz;
+      body.append(buffer, static_cast<size_t>(chunk_sz));
+      remaining -= static_cast<size_t>(chunk_sz);
     }
   }
   return body;
@@ -143,39 +162,48 @@ Task *request2task()
   struct sockaddr_in client_addr;
   socklen_t addrlen = sizeof client_addr;
 
-  int client = accept(server_socket, (struct sockaddr *)&client_addr, &addrlen);
+  const int client = ::accept(server_socket,
+			      reinterpret_cast<struct sockaddr*>(&client_addr),
+			      &addrlen);
   if(client < 0) {
     syslog(LOG_ERR, "Accept: %s", strerror(errno));
     return nullptr;
   }
   
-  char buffer[READ_BUFFER_SZ]; 
-  size_t header_end_pos = std::string::npos;
-  ssize_t chunk_sz;
-  
+  char buffer[READ_BUFFER_SZ];
   std::string request;
+  request.reserve(READ_BUFFER_SZ * 2);
+  size_t header_end_pos = std::string::npos;
   
   // This code may read more data than MAX_REQUEST_SZ
   // but by no more than the buffer size
-  while (request.size() < MAX_REQUEST_SZ &&
-	 (chunk_sz = read(client, buffer, sizeof(buffer))) > 0) {
-    request.append(buffer, chunk_sz);
+  while (request.size() < static_cast<size_t>(MAX_REQUEST_SZ)) {
+    const ssize_t chunk_size = ::read(client, buffer, sizeof(buffer));
+    if (chunk_size <= 0) {
+      break;
+    }
+    
+    request.append(buffer, static_cast<size_t>(chunk_size));
     header_end_pos = request.find(END_OF_HEADER);
     if (header_end_pos != std::string::npos) {
       break;
     }
   }
   
-  if (request.size() > MAX_REQUEST_SZ) {
+  if (request.size() > static_cast<size_t>(MAX_REQUEST_SZ)) {
     reply(client, "HTTP/1.1 413 Content Too Large", "Content Too Large");
     return nullptr;
   }
   
-  if(request.compare(0, strlen("GET "), "GET ") == 0) {
-    std::string headers = request.substr(0, header_end_pos);
-
+  if (header_end_pos == std::string::npos) {
+    reply(client, "HTTP/1.1 400 Bad Request", "Bad Request");
+    return nullptr;
+  }
+  
+  const std::string headers = request.substr(0, header_end_pos);
+ 
+  if(request.compare(0, 4, "GET ") == 0) {
     Task *task = Task::construct(client, headers);
-
     if(!task) {
       reply(client, "HTTP/1.1 400 Bad Request", "Bad Request");
       return nullptr;
@@ -184,9 +212,7 @@ Task *request2task()
     return task;
   }
 
-  if(request.compare(0, strlen("POST "), "POST ") == 0) {
-    std::string headers = request.substr(0, header_end_pos);
-
+  if(request.compare(0, 5, "POST ") == 0) {
     ssize_t content_length = parse_content_length(client, headers);
       
     if (content_length < 0) {
@@ -219,12 +245,12 @@ void graceful_shutdown(int /* sig_num */)
 {
   Script::terminate_all();
   
-  close(server_socket);
+  ::close(server_socket);
   if (unlink(pid_path.c_str()) != 0) {
     syslog(LOG_WARNING, "Unlink(%s): %s", pid_path.c_str(), strerror(errno));
   }
   syslog(LOG_USER, "Terminated.");
-  exit(EXIT_SUCCESS);
+  ::exit(EXIT_SUCCESS);
 }
 
 // The main workhorse. Library functions used:
@@ -251,8 +277,15 @@ int main(int argc, char **argv)
     
     // Main processing happens here
     if (task) {
-        std::thread t(&Task::execute_in_thread, task);
-        t.detach();
+      if(task->execute_as_thread) {
+	std::thread([task]() {
+	  task->execute();
+	  delete task;
+	}).detach();
+      } else {
+	task->execute();
+	delete task;
+      }
     }
   }
 

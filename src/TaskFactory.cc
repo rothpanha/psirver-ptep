@@ -98,6 +98,7 @@ Task *Task::construct(int client, const std::string& headers)
       {"stderr",    [](int client, int job){ return new StderrTask(client, job); }},
       {"stdout",    [](int client, int job){ return new StdoutTask(client, job); }},
       {"terminate", [](int client, int job){ return new TerminateTask(client, job); }},
+      {"purge",     [](int client, int job){ return new PurgeJobTask(client, job); }},
     };
 
     auto action = rest.substr(slash + 1);
