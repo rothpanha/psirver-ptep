@@ -438,8 +438,47 @@ int JobStatusTask::execute()
   // 7. Obtain the corresponding Script with job->get_script().
   // 8. Build the response body as "script_id,status".
   // 9. Reply with HTTP/1.1 200 OK and that body.
+
+  std::string body;
+
+  {
+    std::lock_guard<std::mutex> lock(Job::mutex);
+    auto it = Job::jobs.find(static_cast<pid_t>(job_id));
+    if (it == Job::jobs.end()) {
+      reply(client, "HTTP/1.1 404 Not Found", "Not Found");
+      return 1;
+    }
+
+    Job *job = it->second.get();
+    JobStatus status = job->get_status();
+    std::string status_str;
+
+    switch (status) {
+    case JobStatus::RUNNING:
+      status_str = "RUNNING";
+      break;
+    case JobStatus::FAILED:
+      status_str = "FAILED";
+      break;
+    case JobStatus::TERMINATED:
+      status_str = "TERMINATED";
+      break;
+    case JobStatus::TIMED_OUT:
+      status_str = "TIMED_OUT";
+      break;
+    case JobStatus::OUTPUT_LIMITED:
+      status_str = "OUTPUT_LIMITED";
+      break;
+    case JobStatus::FINISHED:
+      status_str = std::to_string(job->get_result());
+      break;
+    }
+
+    Script *script = job->get_script();
+    body = std::to_string(script->get_id()) + "," + status_str;
+  }
   
-  reply(client, "HTTP/1.1 200 OK", "355,FAILED");
+  reply(client, "HTTP/1.1 200 OK", body.c_str());
   return 0;
 
 };
@@ -454,8 +493,21 @@ int JobListTask::execute()
   //    - obtain the corresponding Script with job->get_script()
   //    - append one line in the format
   //      "job_id,script_id,script_name\n"
-  
-  reply(client, "HTTP/1.1 200 OK", "12345,355,missing.py\n");
+
+   std::string listing;
+
+  {
+    std::lock_guard<std::mutex> lock(Job::mutex);
+    for (const auto& entry : Job::jobs) {
+      Job *job = entry.second.get();
+      Script *script = job->get_script();
+      listing += std::to_string(entry.first) + "," +
+                 std::to_string(script->get_id()) + "," +
+                 script->get_name() + "\n";
+    }
+  }
+
+  reply(client, "HTTP/1.1 200 OK", listing.c_str());
   return 0;
 }
 
@@ -466,6 +518,17 @@ int TerminateTask::execute()
   // 3. If not found, reply 404 Not Found and return.
   // 4. Call job->terminate() to stop the job.
   
+  {
+    std::lock_guard<std::mutex> lock(Job::mutex);
+    auto it = Job::jobs.find(static_cast<pid_t>(job_id));
+    if (it == Job::jobs.end()) {
+      reply(client, "HTTP/1.1 404 Not Found", "Not Found");
+      return 1;
+    }
+
+    it->second->terminate();
+  }
+
   reply(client, "HTTP/1.1 200 OK", "OK");
   return 0;
 }
@@ -477,7 +540,21 @@ int StderrTask::execute()
   // 3. If not found, reply 404 Not Found and return.
   // 4. Obtain the job's standard-error output by calling job->get_stderr().
   
-  reply(client, "HTTP/1.1 200 OK", "Mary had a little lamb");
+  std::string output;
+
+  {
+    std::lock_guard<std::mutex> lock(Job::mutex);
+    auto it = Job::jobs.find(static_cast<pid_t>(job_id));
+    if (it == Job::jobs.end()) {
+      reply(client, "HTTP/1.1 404 Not Found", "Not Found");
+      return 1;
+    }
+
+    output = it->second->get_stderr();
+  }
+  
+
+  reply(client, "HTTP/1.1 200 OK", output.c_str());
   return 0;
 }
 
@@ -488,7 +565,20 @@ int StdoutTask::execute()
   // 3. If not found, reply 404 Not Found and return.
   // 4. Obtain the job's standard output by calling job->get_stdout().
 
-  reply(client, "HTTP/1.1 200 OK", "Its fleece was white as snow");
+  std::string output;
+
+  {
+    std::lock_guard<std::mutex> lock(Job::mutex);
+    auto it = Job::jobs.find(static_cast<pid_t>(job_id));
+    if (it == Job::jobs.end()) {
+      reply(client, "HTTP/1.1 404 Not Found", "Not Found");
+      return 1;
+    }
+
+    output = it->second->get_stdout();
+  }
+
+  reply(client, "HTTP/1.1 200 OK", output.c_str());
   return 0;
 }
 
@@ -505,6 +595,29 @@ int PurgeJobTask::execute()
   // 6. If the removed job is still RUNNING, terminate it.
   // 8. Decrement script->n_jobs (the variable is "atomic")
       
+  std::unique_ptr<Job> removed_job;
+  Script *script = nullptr;
+  bool was_running = false;
+
+  {
+    std::lock_guard<std::mutex> lock(Job::mutex);
+    auto it = Job::jobs.find(static_cast<pid_t>(job_id));
+    if (it == Job::jobs.end()) {
+      reply(client, "HTTP/1.1 404 Not Found", "Not Found");
+      return 1;
+    }
+
+    script = it->second->get_script();
+    was_running = (it->second->get_status() == JobStatus::RUNNING);
+    removed_job = std::move(it->second);
+    Job::jobs.erase(it);
+  }
+
+  if (was_running) {
+    removed_job->terminate();
+  }
+
+  --script->n_jobs;
   reply(client, "HTTP/1.1 200 OK", "OK");
   return 0;
 }
