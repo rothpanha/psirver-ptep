@@ -1,0 +1,22 @@
+# macOS
+.DS_Store
+
+# C++ build output
+psirver
+*.o
+*.d
+DEPEND
+
+# Runtime files
+psirver.pid
+.runtime/
+
+# Uploaded scripts created at runtime
+scripts/[0-9]*/
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
